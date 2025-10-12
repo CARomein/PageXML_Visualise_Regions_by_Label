@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Virtual environments
+venv/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output files
+visualisations/
+output/
+overview_*.png
+
+# PageXML data (uncomment if you don't want to commit test data)
+# pagexml_*/

@@ -1,0 +1,23 @@
+{
+  "_comment": "Custom colour configuration for PageXML region visualisation",
+  "_note": "RGB values range from 0 to 255. Use lighter colours for better visibility with semi-transparent fills",
+  
+  "prop_request_rekest": [255, 200, 200],
+  "attendance_list": [200, 255, 200],
+  "prop_decission": [200, 200, 255],
+  "marginalia": [255, 255, 200],
+  "catch_word": [255, 220, 180],
+  "header": [220, 180, 255],
+  "page-number": [180, 220, 255],
+  "signature": [255, 180, 220],
+  "prop_missive": [255, 210, 210],
+  "prop_plakkaat": [210, 255, 210],
+  "prop_remonstrantie": [210, 210, 255],
+  "prop_klacht": [255, 255, 210],
+  "prop_instructie": [255, 230, 200],
+  "prop_goetgevonden": [230, 200, 255],
+  "TOC-entry": [200, 255, 255],
+  "paragraph": [240, 240, 240],
+  "heading": [200, 200, 200],
+  "date": [255, 200, 255]
+}
