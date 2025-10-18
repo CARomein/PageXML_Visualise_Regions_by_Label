@@ -2,7 +2,7 @@ import os
 import re
 import json
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from PIL import Image, ImageDraw, ImageFont
 import argparse
 from collections import Counter, defaultdict
@@ -75,12 +75,172 @@ def extract_structure_type(custom_str: str) -> Optional[str]:
     return None
 
 
-def parse_pagexml(xml_file: str) -> Tuple[List[Dict], int, int, str]:
+def point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[int, int]]) -> bool:
+    """Check if a point is inside a polygon using ray casting algorithm."""
+    x, y = point
+    n = len(polygon)
+    inside = False
+    
+    p1x, p1y = polygon[0]
+    for i in range(1, n + 1):
+        p2x, p2y = polygon[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    
+    return inside
+
+
+def line_segment_intersects_polygon_edge(
+    line_start: Tuple[float, float],
+    line_end: Tuple[float, float],
+    polygon: List[Tuple[int, int]]
+) -> List[Tuple[Tuple[float, float], int]]:
     """
-    Parse PageXML file and extract region information.
+    Check if a line segment intersects any edge of a polygon.
+    Returns list of (intersection_point, edge_index) tuples.
+    """
+    intersections = []
+    n = len(polygon)
+    
+    x1, y1 = line_start
+    x2, y2 = line_end
+    
+    for i in range(n):
+        x3, y3 = polygon[i]
+        x4, y4 = polygon[(i + 1) % n]
+        
+        # Calculate intersection using line segment intersection formula
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        
+        if abs(denom) < 1e-10:  # Lines are parallel
+            continue
+        
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+        
+        # Check if intersection is within both line segments
+        if 0 <= t <= 1 and 0 <= u <= 1:
+            int_x = x1 + t * (x2 - x1)
+            int_y = y1 + t * (y2 - y1)
+            intersections.append(((int_x, int_y), i))
+    
+    return intersections
+
+
+def find_textline_crossings(
+    regions: List[Dict],
+    textlines: List[Dict]
+) -> List[Dict]:
+    """
+    Find textlines that physically extend into a different region than they are assigned to.
+    
+    A crossing occurs when a textline that belongs to region X has coordinates that
+    fall within region Y (regardless of whether X=A and Y=B, or X=B and Y=A).
+    
+    This detects:
+    - Textline assigned to region A but coordinates run through region B
+    - Textline assigned to region B but coordinates run through region A
+    - Any textline that crosses from its assigned region into any other region
+    
+    Returns list of crossing information dicts with:
+    - crossing_point: (x, y) coordinates where the line enters the wrong region
+    - textline_id: ID of the problematic textline
+    - assigned_region: Region the textline is assigned to
+    - crossed_region: Region the textline physically enters
+    """
+    crossings = []
+    
+    # Create lookup dict for regions by ID
+    region_lookup = {region['id']: region for region in regions if len(region['points']) >= 3}
+    
+    for textline in textlines:
+        if len(textline['points']) < 2:
+            continue
+        
+        # Get the region this textline is assigned to
+        assigned_region_id = textline.get('region_id')
+        if not assigned_region_id or assigned_region_id not in region_lookup:
+            continue
+        
+        assigned_region = region_lookup[assigned_region_id]
+        line_points = textline['points']
+        
+        # Track which regions this textline has already been marked as crossing
+        already_crossed = set()
+        
+        # Check each point of the textline
+        for point_idx, point in enumerate(line_points):
+            # Check if this point is inside any OTHER region
+            for region_id, region in region_lookup.items():
+                # Skip the region this textline is assigned to
+                if region_id == assigned_region_id:
+                    continue
+                
+                # Skip if we already marked a crossing with this region
+                if region_id in already_crossed:
+                    continue
+                
+                # Check if this point is inside this other region
+                if point_in_polygon(point, region['points']):
+                    crossings.append({
+                        'crossing_point': point,
+                        'textline_id': textline.get('id', 'unknown'),
+                        'assigned_region': assigned_region_id,
+                        'crossed_region': region_id,
+                        'point_index': point_idx
+                    })
+                    already_crossed.add(region_id)
+                    break  # Found a crossing, move to next point
+        
+        # Also check line segments for boundary crossings
+        for i in range(len(line_points) - 1):
+            line_start = line_points[i]
+            line_end = line_points[i + 1]
+            
+            # Check if this segment crosses into any OTHER region
+            for region_id, region in region_lookup.items():
+                # Skip the region this textline is assigned to
+                if region_id == assigned_region_id:
+                    continue
+                
+                # Skip if we already marked a crossing with this region
+                if region_id in already_crossed:
+                    continue
+                
+                # Check if line segment intersects with this region's boundary
+                intersections = line_segment_intersects_polygon_edge(
+                    line_start, line_end, region['points']
+                )
+                
+                # For each intersection, verify the line actually enters the region
+                for intersection_point, edge_index in intersections:
+                    # Check if the endpoint is inside this region (meaning line enters it)
+                    if point_in_polygon(line_end, region['points']):
+                        crossings.append({
+                            'crossing_point': intersection_point,
+                            'textline_id': textline.get('id', 'unknown'),
+                            'assigned_region': assigned_region_id,
+                            'crossed_region': region_id,
+                            'edge_index': edge_index
+                        })
+                        already_crossed.add(region_id)
+                        break  # Only record one crossing per segment per region
+    
+    return crossings
+
+
+def parse_pagexml(xml_file: str) -> Tuple[List[Dict], List[Dict], int, int, str]:
+    """
+    Parse PageXML file and extract region and textline information.
     
     Returns:
-        Tuple of (regions_list, image_width, image_height, page_name)
+        Tuple of (regions_list, textlines_list, image_width, image_height, page_name)
     """
     tree = ET.parse(xml_file)
     root = tree.getroot()
@@ -97,6 +257,8 @@ def parse_pagexml(xml_file: str) -> Tuple[List[Dict], int, int, str]:
     
     # Extract all text regions
     regions = []
+    textlines = []
+    
     text_regions = root.findall('.//ns:TextRegion', ns)
     
     for region in text_regions:
@@ -106,7 +268,7 @@ def parse_pagexml(xml_file: str) -> Tuple[List[Dict], int, int, str]:
         # Extract structure type
         label = extract_structure_type(custom_str)
         
-        # Extract coordinates
+        # Extract region coordinates
         coords_elem = region.find('ns:Coords', ns)
         if coords_elem is not None:
             points_str = coords_elem.attrib.get('points', '')
@@ -117,8 +279,36 @@ def parse_pagexml(xml_file: str) -> Tuple[List[Dict], int, int, str]:
                 'label': label,
                 'points': points
             })
+        
+        # Extract textlines within this region
+        for textline in region.findall('.//ns:TextLine', ns):
+            textline_id = textline.attrib.get('id', '')
+            
+            # Get baseline or coords
+            baseline_elem = textline.find('ns:Baseline', ns)
+            if baseline_elem is not None:
+                points_str = baseline_elem.attrib.get('points', '')
+                if points_str:
+                    points = [tuple(map(int, point.split(','))) for point in points_str.split()]
+                    textlines.append({
+                        'id': textline_id,
+                        'region_id': region_id,
+                        'points': points
+                    })
+            else:
+                # Fallback to Coords if no Baseline
+                coords_elem = textline.find('ns:Coords', ns)
+                if coords_elem is not None:
+                    points_str = coords_elem.attrib.get('points', '')
+                    if points_str:
+                        points = [tuple(map(int, point.split(','))) for point in points_str.split()]
+                        textlines.append({
+                            'id': textline_id,
+                            'region_id': region_id,
+                            'points': points
+                        })
     
-    return regions, image_width, image_height, page_name
+    return regions, textlines, image_width, image_height, page_name
 
 
 def generate_colour_scheme(labels: List[str], dark_theme: bool = False) -> Dict[str, Tuple[int, int, int]]:
@@ -147,6 +337,8 @@ def generate_colour_scheme(labels: List[str], dark_theme: bool = False) -> Dict[
 
 def draw_page_schematic(
     regions: List[Dict],
+    textlines: List[Dict],
+    crossings: List[Dict],
     page_width: int,
     page_height: int,
     page_name: str,
@@ -155,7 +347,7 @@ def draw_page_schematic(
     scale: float = 0.15
 ) -> Image.Image:
     """
-    Draw a schematic representation of a page with coloured regions.
+    Draw a schematic representation of a page with coloured regions and crossing markers.
     """
     # Calculate scaled dimensions
     scaled_width = int(page_width * scale)
@@ -191,14 +383,34 @@ def draw_page_schematic(
             # Unlabelled regions: only draw outline
             draw.polygon(scaled_points, fill=None, outline=outline_colour, width=1)
     
+    # Draw crossing markers (bold red crosses)
+    cross_size = max(3, int(8 * scale))  # Scale-dependent cross size
+    for crossing in crossings:
+        x, y = crossing['crossing_point']
+        x_scaled = int(x * scale)
+        y_scaled = int(y * scale)
+        
+        # Draw a bold red X
+        cross_colour = (255, 0, 0)  # Bright red
+        cross_width = max(2, int(3 * scale / 0.15))  # Thicker for visibility
+        
+        # Draw X shape
+        draw.line([(x_scaled - cross_size, y_scaled - cross_size),
+                   (x_scaled + cross_size, y_scaled + cross_size)],
+                  fill=cross_colour, width=cross_width)
+        draw.line([(x_scaled - cross_size, y_scaled + cross_size),
+                   (x_scaled + cross_size, y_scaled - cross_size)],
+                  fill=cross_colour, width=cross_width)
+    
     return img
 
 
 def create_overview_grid(
-    page_images: List[Tuple[Image.Image, str]],
+    page_images: List[Tuple[Image.Image, str, int]],
     colour_scheme: Dict[str, Tuple[int, int, int]],
     label_counts: Dict[str, int],
     archief_name: str,
+    total_crossings: int,
     dark_theme: bool = False,
     columns: int = 2
 ) -> Image.Image:
@@ -213,8 +425,8 @@ def create_overview_grid(
     rows = math.ceil(n_pages / columns)
     
     # Get maximum dimensions for uniform grid
-    max_width = max(img.width for img, _ in page_images)
-    max_height = max(img.height for img, _ in page_images)
+    max_width = max(img.width for img, _, _ in page_images)
+    max_height = max(img.height for img, _, _ in page_images)
     
     # Add padding
     padding = 20
@@ -224,7 +436,7 @@ def create_overview_grid(
     cell_height = max_height + padding * 2 + label_height
     
     # Create legend
-    legend_height = max(400, len(colour_scheme) * 30 + 100)
+    legend_height = max(400, len(colour_scheme) * 30 + 150)
     
     # Calculate total dimensions
     grid_width = columns * cell_width
@@ -253,7 +465,7 @@ def create_overview_grid(
     draw.text((padding, padding), title_text, fill=text_colour, font=title_font)
     
     # Place pages in grid
-    for idx, (img, page_id) in enumerate(page_images):
+    for idx, (img, page_id, crossing_count) in enumerate(page_images):
         row = idx // columns
         col = idx % columns
         
@@ -263,9 +475,12 @@ def create_overview_grid(
         # Paste image
         canvas.paste(img, (x, y))
         
-        # Draw label
+        # Draw label with crossing count
         label_y = y + img.height + 5
-        draw.text((x, label_y), page_id, fill=text_colour, font=font)
+        label_text = f"{page_id}"
+        if crossing_count > 0:
+            label_text += f" ({crossing_count} crossings)"
+        draw.text((x, label_y), label_text, fill=text_colour, font=font)
     
     # Draw legend at bottom
     legend_y = grid_height + title_height + 20
@@ -300,6 +515,17 @@ def create_overview_grid(
                  f"Unlabelled: {label_counts['unlabeled']} regions", 
                  fill=text_colour, font=font)
     
+    # Add crossing information
+    legend_y += 30
+    draw.text((padding, legend_y), 
+             f"Total textline crossings: {total_crossings}", 
+             fill=(255, 0, 0) if not dark_theme else (255, 100, 100), 
+             font=legend_title_font)
+    legend_y += 25
+    draw.text((padding, legend_y), 
+             "Red crosses (✗) indicate textlines crossing region boundaries", 
+             fill=text_colour, font=font)
+    
     return canvas
 
 
@@ -328,25 +554,91 @@ def process_directory(
     # Generate timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    # Collect all XML files grouped by archief
+    # Collect all XML files grouped by collection and archief
+    collection_structure = defaultdict(lambda: defaultdict(list))
     archief_files = defaultdict(list)
     
-    for archief_dir in os.listdir(input_dir):
-        archief_path = os.path.join(input_dir, archief_dir)
-        if not os.path.isdir(archief_path):
-            continue
-        
-        page_dir = os.path.join(archief_path, 'page')
-        if not os.path.isdir(page_dir):
-            continue
-        
-        for page_file in os.listdir(page_dir):
-            if page_file.endswith('.xml'):
-                xml_path = os.path.join(page_dir, page_file)
-                archief_files[archief_dir].append(xml_path)
+    print(f"Scanning directory: {input_dir}")
     
-    if not archief_files:
-        print(f"No XML files found in {input_dir}")
+    try:
+        items = os.listdir(input_dir)
+        print(f"Found {len(items)} items in input directory")
+    except Exception as e:
+        print(f"Error reading input directory: {e}")
+        return
+    
+    # First level: check if items are archief directories with page/ subdirectories
+    found_direct_archiefs = False
+    for item in items:
+        item_path = os.path.join(input_dir, item)
+        
+        if not os.path.isdir(item_path):
+            continue
+        
+        page_dir = os.path.join(item_path, 'page')
+        if os.path.isdir(page_dir):
+            xml_files = [f for f in os.listdir(page_dir) if f.endswith('.xml')]
+            if xml_files:
+                for xml_file in xml_files:
+                    xml_path = os.path.join(page_dir, xml_file)
+                    archief_files[item].append(xml_path)
+                found_direct_archiefs = True
+    
+    # If no direct archiefs found, check for collection structure
+    if not found_direct_archiefs:
+        print("No direct archief directories found, checking for collection structure...")
+        
+        for collection_item in items:
+            collection_path = os.path.join(input_dir, collection_item)
+            
+            if not os.path.isdir(collection_path):
+                continue
+            
+            try:
+                archief_items = os.listdir(collection_path)
+            except:
+                continue
+            
+            for archief_item in archief_items:
+                archief_path = os.path.join(collection_path, archief_item)
+                
+                if not os.path.isdir(archief_path):
+                    continue
+                
+                page_dir = os.path.join(archief_path, 'page')
+                if os.path.isdir(page_dir):
+                    xml_files = [f for f in os.listdir(page_dir) if f.endswith('.xml')]
+                    if xml_files:
+                        for xml_file in xml_files:
+                            xml_path = os.path.join(page_dir, xml_file)
+                            collection_structure[collection_item][archief_item].append(xml_path)
+    
+    # Determine which structure we found
+    if collection_structure:
+        # Collection structure found
+        total_archiefs = sum(len(archiefs) for archiefs in collection_structure.values())
+        total_files = sum(
+            len(xml_files)
+            for archiefs in collection_structure.values()
+            for xml_files in archiefs.values()
+        )
+        print(f"Found collection structure: {len(collection_structure)} collections, {total_archiefs} archiefs, {total_files} total XML files")
+        
+        # Flatten to archief_files for processing, with collection prefix
+        for collection_name, archiefs in collection_structure.items():
+            for archief_name, xml_files in archiefs.items():
+                combined_name = f"{collection_name}_{archief_name}"
+                archief_files[combined_name] = xml_files
+        
+    elif archief_files:
+        total_files = sum(len(files) for files in archief_files.values())
+        print(f"Found {len(archief_files)} archief directories with {total_files} total XML files")
+    
+    else:
+        print(f"\nERROR: No XML files found in expected structure.")
+        print(f"Expected structure:")
+        print(f"  Option 1: {input_dir}/[archief_dir]/page/*.xml")
+        print(f"  Option 2: {input_dir}/[collection_dir]/[archief_dir]/page/*.xml")
         return
     
     total_files = sum(len(files) for files in archief_files.values())
@@ -359,7 +651,7 @@ def process_directory(
     for archief_dir, xml_files in archief_files.items():
         for xml_file in xml_files:
             try:
-                regions, _, _, _ = parse_pagexml(xml_file)
+                regions, textlines, _, _, _ = parse_pagexml(xml_file)
                 for region in regions:
                     if region['label']:
                         all_labels.add(region['label'])
@@ -386,13 +678,14 @@ def process_directory(
         # Count labels in this archief
         archief_label_counts = Counter()
         archief_unlabeled = 0
+        total_crossings = 0
         
         # Create page schematics for this archief
         page_images = []
         
         for idx, xml_file in enumerate(xml_files):
             try:
-                regions, page_width, page_height, page_name = parse_pagexml(xml_file)
+                regions, textlines, page_width, page_height, page_name = parse_pagexml(xml_file)
                 
                 # Count labels
                 for region in regions:
@@ -401,9 +694,15 @@ def process_directory(
                     else:
                         archief_unlabeled += 1
                 
+                # Find textline crossings
+                crossings = find_textline_crossings(regions, textlines)
+                total_crossings += len(crossings)
+                
                 # Create schematic
                 img = draw_page_schematic(
                     regions,
+                    textlines,
+                    crossings,
                     page_width,
                     page_height,
                     page_name,
@@ -412,7 +711,7 @@ def process_directory(
                     scale
                 )
                 
-                page_images.append((img, page_name))
+                page_images.append((img, page_name, len(crossings)))
                 
                 if (idx + 1) % 50 == 0 or (idx + 1) == len(xml_files):
                     print(f"  Processed {idx + 1}/{len(xml_files)} pages...", end='\r')
@@ -421,6 +720,7 @@ def process_directory(
                 print(f"\n  Error processing {xml_file}: {e}")
         
         print(f"\n  Generated {len(page_images)} page schematics")
+        print(f"  Found {total_crossings} textline crossings")
         
         archief_label_counts['unlabeled'] = archief_unlabeled
         
@@ -431,13 +731,14 @@ def process_directory(
             colour_scheme,
             archief_label_counts,
             archief_dir,
+            total_crossings,
             dark_theme,
             columns
         )
         
         if overview:
             # Save overview with timestamp prefix
-            output_filename = f"overview_v_{timestamp}_{archief_dir}.png"
+            output_filename = f"overview_vc_{timestamp}_{archief_dir}.png"
             output_path = os.path.join(output_dir, output_filename)
             overview.save(output_path, quality=95)
             print(f"  Saved: {output_filename} ({overview.width} x {overview.height} pixels)")
@@ -452,7 +753,7 @@ def process_directory(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Create schematic overviews of PageXML regions per archief'
+        description='Create schematic overviews of PageXML regions per archief with textline crossing detection'
     )
     parser.add_argument('input_dir', type=str,
                        help='Input directory containing PageXML files')

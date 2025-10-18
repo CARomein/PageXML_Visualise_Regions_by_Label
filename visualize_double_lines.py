@@ -2,7 +2,7 @@ import os
 import re
 import json
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 from PIL import Image, ImageDraw, ImageFont
 import argparse
 from collections import Counter, defaultdict
@@ -75,12 +75,85 @@ def extract_structure_type(custom_str: str) -> Optional[str]:
     return None
 
 
-def parse_pagexml(xml_file: str) -> Tuple[List[Dict], int, int, str]:
+def normalize_text(text: str) -> str:
     """
-    Parse PageXML file and extract region information.
+    Normalize text for comparison by:
+    - Converting to lowercase
+    - Removing extra whitespace
+    - Removing punctuation
+    """
+    if not text:
+        return ""
+    
+    # Convert to lowercase
+    text = text.lower()
+    
+    # Remove punctuation (but keep spaces)
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    # Normalize whitespace
+    text = ' '.join(text.split())
+    
+    return text
+
+
+def find_duplicate_sentences(textlines: List[Dict]) -> List[Dict]:
+    """
+    Find duplicate sentences in the transcription.
+    
+    Returns list of duplicate information dicts with:
+    - duplicate_point: (x, y) coordinates of the duplicate textline
+    - textline_id: ID of the duplicate textline
+    - text: The duplicate text
+    - original_textline_id: ID of the original occurrence
+    """
+    duplicates = []
+    
+    # Build a dictionary of normalized text to textlines
+    text_to_textlines = defaultdict(list)
+    
+    for textline in textlines:
+        text = textline.get('text', '').strip()
+        if not text or len(text) < 5:  # Skip very short texts
+            continue
+        
+        normalized = normalize_text(text)
+        if not normalized:
+            continue
+        
+        text_to_textlines[normalized].append(textline)
+    
+    # Find duplicates
+    for normalized_text, lines in text_to_textlines.items():
+        if len(lines) > 1:
+            # First occurrence is the "original", rest are duplicates
+            original = lines[0]
+            for duplicate_line in lines[1:]:
+                # Get the center point of the textline
+                points = duplicate_line.get('points', [])
+                if points:
+                    # Calculate center of textline
+                    x_coords = [p[0] for p in points]
+                    y_coords = [p[1] for p in points]
+                    center_x = sum(x_coords) / len(x_coords)
+                    center_y = sum(y_coords) / len(y_coords)
+                    
+                    duplicates.append({
+                        'duplicate_point': (center_x, center_y),
+                        'textline_id': duplicate_line.get('id', 'unknown'),
+                        'text': duplicate_line.get('text', ''),
+                        'original_textline_id': original.get('id', 'unknown')
+                    })
+    
+    return duplicates
+
+
+def parse_pagexml(xml_file: str) -> Tuple[List[Dict], List[Dict], int, int, str]:
+    """
+    Parse PageXML file and extract region and textline information with text content.
     
     Returns:
-        Tuple of (regions_list, image_width, image_height, page_name)
+        Tuple of (regions_list, textlines_list, image_width, image_height, page_name)
     """
     tree = ET.parse(xml_file)
     root = tree.getroot()
@@ -97,6 +170,8 @@ def parse_pagexml(xml_file: str) -> Tuple[List[Dict], int, int, str]:
     
     # Extract all text regions
     regions = []
+    textlines = []
+    
     text_regions = root.findall('.//ns:TextRegion', ns)
     
     for region in text_regions:
@@ -106,7 +181,7 @@ def parse_pagexml(xml_file: str) -> Tuple[List[Dict], int, int, str]:
         # Extract structure type
         label = extract_structure_type(custom_str)
         
-        # Extract coordinates
+        # Extract region coordinates
         coords_elem = region.find('ns:Coords', ns)
         if coords_elem is not None:
             points_str = coords_elem.attrib.get('points', '')
@@ -117,8 +192,46 @@ def parse_pagexml(xml_file: str) -> Tuple[List[Dict], int, int, str]:
                 'label': label,
                 'points': points
             })
+        
+        # Extract textlines within this region
+        for textline in region.findall('.//ns:TextLine', ns):
+            textline_id = textline.attrib.get('id', '')
+            
+            # Get text content
+            text_equiv = textline.find('ns:TextEquiv', ns)
+            text_content = ''
+            if text_equiv is not None:
+                unicode_elem = text_equiv.find('ns:Unicode', ns)
+                if unicode_elem is not None and unicode_elem.text:
+                    text_content = unicode_elem.text
+            
+            # Get baseline or coords
+            baseline_elem = textline.find('ns:Baseline', ns)
+            if baseline_elem is not None:
+                points_str = baseline_elem.attrib.get('points', '')
+                if points_str:
+                    points = [tuple(map(int, point.split(','))) for point in points_str.split()]
+                    textlines.append({
+                        'id': textline_id,
+                        'region_id': region_id,
+                        'points': points,
+                        'text': text_content
+                    })
+            else:
+                # Fallback to Coords if no Baseline
+                coords_elem = textline.find('ns:Coords', ns)
+                if coords_elem is not None:
+                    points_str = coords_elem.attrib.get('points', '')
+                    if points_str:
+                        points = [tuple(map(int, point.split(','))) for point in points_str.split()]
+                        textlines.append({
+                            'id': textline_id,
+                            'region_id': region_id,
+                            'points': points,
+                            'text': text_content
+                        })
     
-    return regions, image_width, image_height, page_name
+    return regions, textlines, image_width, image_height, page_name
 
 
 def generate_colour_scheme(labels: List[str], dark_theme: bool = False) -> Dict[str, Tuple[int, int, int]]:
@@ -147,6 +260,8 @@ def generate_colour_scheme(labels: List[str], dark_theme: bool = False) -> Dict[
 
 def draw_page_schematic(
     regions: List[Dict],
+    textlines: List[Dict],
+    duplicates: List[Dict],
     page_width: int,
     page_height: int,
     page_name: str,
@@ -155,7 +270,7 @@ def draw_page_schematic(
     scale: float = 0.15
 ) -> Image.Image:
     """
-    Draw a schematic representation of a page with coloured regions.
+    Draw a schematic representation of a page with coloured regions and duplicate markers.
     """
     # Calculate scaled dimensions
     scaled_width = int(page_width * scale)
@@ -191,14 +306,32 @@ def draw_page_schematic(
             # Unlabelled regions: only draw outline
             draw.polygon(scaled_points, fill=None, outline=outline_colour, width=1)
     
+    # Draw duplicate markers (purple asterisks)
+    try:
+        font = ImageFont.truetype("arial.ttf", max(14, int(20 * scale / 0.15)))
+    except:
+        font = ImageFont.load_default()
+    
+    for duplicate in duplicates:
+        x, y = duplicate['duplicate_point']
+        x_scaled = int(x * scale)
+        y_scaled = int(y * scale)
+        
+        # Draw purple asterisk
+        asterisk_colour = (128, 0, 128)  # Purple
+        
+        # Draw asterisk character
+        draw.text((x_scaled - 6, y_scaled - 8), '*', fill=asterisk_colour, font=font)
+    
     return img
 
 
 def create_overview_grid(
-    page_images: List[Tuple[Image.Image, str]],
+    page_images: List[Tuple[Image.Image, str, int]],
     colour_scheme: Dict[str, Tuple[int, int, int]],
     label_counts: Dict[str, int],
     archief_name: str,
+    total_duplicates: int,
     dark_theme: bool = False,
     columns: int = 2
 ) -> Image.Image:
@@ -213,8 +346,8 @@ def create_overview_grid(
     rows = math.ceil(n_pages / columns)
     
     # Get maximum dimensions for uniform grid
-    max_width = max(img.width for img, _ in page_images)
-    max_height = max(img.height for img, _ in page_images)
+    max_width = max(img.width for img, _, _ in page_images)
+    max_height = max(img.height for img, _, _ in page_images)
     
     # Add padding
     padding = 20
@@ -224,7 +357,7 @@ def create_overview_grid(
     cell_height = max_height + padding * 2 + label_height
     
     # Create legend
-    legend_height = max(400, len(colour_scheme) * 30 + 100)
+    legend_height = max(400, len(colour_scheme) * 30 + 150)
     
     # Calculate total dimensions
     grid_width = columns * cell_width
@@ -253,7 +386,7 @@ def create_overview_grid(
     draw.text((padding, padding), title_text, fill=text_colour, font=title_font)
     
     # Place pages in grid
-    for idx, (img, page_id) in enumerate(page_images):
+    for idx, (img, page_id, duplicate_count) in enumerate(page_images):
         row = idx // columns
         col = idx % columns
         
@@ -263,9 +396,12 @@ def create_overview_grid(
         # Paste image
         canvas.paste(img, (x, y))
         
-        # Draw label
+        # Draw label with duplicate count
         label_y = y + img.height + 5
-        draw.text((x, label_y), page_id, fill=text_colour, font=font)
+        label_text = f"{page_id}"
+        if duplicate_count > 0:
+            label_text += f" ({duplicate_count} duplicates)"
+        draw.text((x, label_y), label_text, fill=text_colour, font=font)
     
     # Draw legend at bottom
     legend_y = grid_height + title_height + 20
@@ -300,6 +436,17 @@ def create_overview_grid(
                  f"Unlabelled: {label_counts['unlabeled']} regions", 
                  fill=text_colour, font=font)
     
+    # Add duplicate information
+    legend_y += 30
+    draw.text((padding, legend_y), 
+             f"Total duplicate sentences: {total_duplicates}", 
+             fill=(128, 0, 128) if not dark_theme else (200, 100, 200), 
+             font=legend_title_font)
+    legend_y += 25
+    draw.text((padding, legend_y), 
+             "Purple asterisks (*) indicate duplicate sentences in transcription", 
+             fill=text_colour, font=font)
+    
     return canvas
 
 
@@ -328,25 +475,91 @@ def process_directory(
     # Generate timestamp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    # Collect all XML files grouped by archief
+    # Collect all XML files grouped by collection and archief
+    collection_structure = defaultdict(lambda: defaultdict(list))
     archief_files = defaultdict(list)
     
-    for archief_dir in os.listdir(input_dir):
-        archief_path = os.path.join(input_dir, archief_dir)
-        if not os.path.isdir(archief_path):
-            continue
-        
-        page_dir = os.path.join(archief_path, 'page')
-        if not os.path.isdir(page_dir):
-            continue
-        
-        for page_file in os.listdir(page_dir):
-            if page_file.endswith('.xml'):
-                xml_path = os.path.join(page_dir, page_file)
-                archief_files[archief_dir].append(xml_path)
+    print(f"Scanning directory: {input_dir}")
     
-    if not archief_files:
-        print(f"No XML files found in {input_dir}")
+    try:
+        items = os.listdir(input_dir)
+        print(f"Found {len(items)} items in input directory")
+    except Exception as e:
+        print(f"Error reading input directory: {e}")
+        return
+    
+    # First level: check if items are archief directories with page/ subdirectories
+    found_direct_archiefs = False
+    for item in items:
+        item_path = os.path.join(input_dir, item)
+        
+        if not os.path.isdir(item_path):
+            continue
+        
+        page_dir = os.path.join(item_path, 'page')
+        if os.path.isdir(page_dir):
+            xml_files = [f for f in os.listdir(page_dir) if f.endswith('.xml')]
+            if xml_files:
+                for xml_file in xml_files:
+                    xml_path = os.path.join(page_dir, xml_file)
+                    archief_files[item].append(xml_path)
+                found_direct_archiefs = True
+    
+    # If no direct archiefs found, check for collection structure
+    if not found_direct_archiefs:
+        print("No direct archief directories found, checking for collection structure...")
+        
+        for collection_item in items:
+            collection_path = os.path.join(input_dir, collection_item)
+            
+            if not os.path.isdir(collection_path):
+                continue
+            
+            try:
+                archief_items = os.listdir(collection_path)
+            except:
+                continue
+            
+            for archief_item in archief_items:
+                archief_path = os.path.join(collection_path, archief_item)
+                
+                if not os.path.isdir(archief_path):
+                    continue
+                
+                page_dir = os.path.join(archief_path, 'page')
+                if os.path.isdir(page_dir):
+                    xml_files = [f for f in os.listdir(page_dir) if f.endswith('.xml')]
+                    if xml_files:
+                        for xml_file in xml_files:
+                            xml_path = os.path.join(page_dir, xml_file)
+                            collection_structure[collection_item][archief_item].append(xml_path)
+    
+    # Determine which structure we found
+    if collection_structure:
+        # Collection structure found
+        total_archiefs = sum(len(archiefs) for archiefs in collection_structure.values())
+        total_files = sum(
+            len(xml_files)
+            for archiefs in collection_structure.values()
+            for xml_files in archiefs.values()
+        )
+        print(f"Found collection structure: {len(collection_structure)} collections, {total_archiefs} archiefs, {total_files} total XML files")
+        
+        # Flatten to archief_files for processing, with collection prefix
+        for collection_name, archiefs in collection_structure.items():
+            for archief_name, xml_files in archiefs.items():
+                combined_name = f"{collection_name}_{archief_name}"
+                archief_files[combined_name] = xml_files
+        
+    elif archief_files:
+        total_files = sum(len(files) for files in archief_files.values())
+        print(f"Found {len(archief_files)} archief directories with {total_files} total XML files")
+    
+    else:
+        print(f"\nERROR: No XML files found in expected structure.")
+        print(f"Expected structure:")
+        print(f"  Option 1: {input_dir}/[archief_dir]/page/*.xml")
+        print(f"  Option 2: {input_dir}/[collection_dir]/[archief_dir]/page/*.xml")
         return
     
     total_files = sum(len(files) for files in archief_files.values())
@@ -359,7 +572,7 @@ def process_directory(
     for archief_dir, xml_files in archief_files.items():
         for xml_file in xml_files:
             try:
-                regions, _, _, _ = parse_pagexml(xml_file)
+                regions, textlines, _, _, _ = parse_pagexml(xml_file)
                 for region in regions:
                     if region['label']:
                         all_labels.add(region['label'])
@@ -386,13 +599,14 @@ def process_directory(
         # Count labels in this archief
         archief_label_counts = Counter()
         archief_unlabeled = 0
+        total_duplicates = 0
         
         # Create page schematics for this archief
         page_images = []
         
         for idx, xml_file in enumerate(xml_files):
             try:
-                regions, page_width, page_height, page_name = parse_pagexml(xml_file)
+                regions, textlines, page_width, page_height, page_name = parse_pagexml(xml_file)
                 
                 # Count labels
                 for region in regions:
@@ -401,9 +615,15 @@ def process_directory(
                     else:
                         archief_unlabeled += 1
                 
+                # Find duplicate sentences
+                duplicates = find_duplicate_sentences(textlines)
+                total_duplicates += len(duplicates)
+                
                 # Create schematic
                 img = draw_page_schematic(
                     regions,
+                    textlines,
+                    duplicates,
                     page_width,
                     page_height,
                     page_name,
@@ -412,7 +632,7 @@ def process_directory(
                     scale
                 )
                 
-                page_images.append((img, page_name))
+                page_images.append((img, page_name, len(duplicates)))
                 
                 if (idx + 1) % 50 == 0 or (idx + 1) == len(xml_files):
                     print(f"  Processed {idx + 1}/{len(xml_files)} pages...", end='\r')
@@ -421,6 +641,7 @@ def process_directory(
                 print(f"\n  Error processing {xml_file}: {e}")
         
         print(f"\n  Generated {len(page_images)} page schematics")
+        print(f"  Found {total_duplicates} duplicate sentences")
         
         archief_label_counts['unlabeled'] = archief_unlabeled
         
@@ -431,13 +652,14 @@ def process_directory(
             colour_scheme,
             archief_label_counts,
             archief_dir,
+            total_duplicates,
             dark_theme,
             columns
         )
         
         if overview:
             # Save overview with timestamp prefix
-            output_filename = f"overview_v_{timestamp}_{archief_dir}.png"
+            output_filename = f"overview_vd_{timestamp}_{archief_dir}.png"
             output_path = os.path.join(output_dir, output_filename)
             overview.save(output_path, quality=95)
             print(f"  Saved: {output_filename} ({overview.width} x {overview.height} pixels)")
@@ -452,7 +674,7 @@ def process_directory(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Create schematic overviews of PageXML regions per archief'
+        description='Create schematic overviews of PageXML regions per archief with duplicate sentence detection'
     )
     parser.add_argument('input_dir', type=str,
                        help='Input directory containing PageXML files')
