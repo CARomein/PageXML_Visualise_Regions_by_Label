@@ -534,7 +534,8 @@ def process_directory(
     colour_config: Optional[str] = None,
     dark_theme: bool = False,
     scale: float = 0.15,
-    columns: int = 2
+    columns: int = 2,
+    selected_collections: Optional[List[str]] = None
 ) -> None:
     """
     Process all PageXML files and create overview images per archief.
@@ -545,10 +546,10 @@ def process_directory(
         dark_theme: Whether to use dark theme
         scale: Scale factor for individual pages
         columns: Number of columns in grid layout
+        selected_collections: Optional list of collection folder names to process
     """
-    # Create output directory in script location
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(script_dir, 'visualizer')
+    # Create output directory in current working directory
+    output_dir = os.path.join(os.getcwd(), 'visualizer')
     os.makedirs(output_dir, exist_ok=True)
     
     # Generate timestamp
@@ -566,6 +567,16 @@ def process_directory(
     except Exception as e:
         print(f"Error reading input directory: {e}")
         return
+    
+    # Filter items if specific collections are requested
+    if selected_collections:
+        original_count = len(items)
+        items = [item for item in items if item in selected_collections]
+        print(f"Filtering to {len(items)} selected collection(s): {', '.join(selected_collections)}")
+        if len(items) == 0:
+            print(f"ERROR: None of the specified collections were found in {input_dir}")
+            print(f"Available folders: {', '.join(sorted(os.listdir(input_dir))[:10])}...")
+            return
     
     # First level: check if items are archief directories with page/ subdirectories
     found_direct_archiefs = False
@@ -753,10 +764,13 @@ def process_directory(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Create schematic overviews of PageXML regions per archief with textline crossing detection'
+        description='Create schematic overviews of PageXML regions per archief with textline crossing detection',
+        epilog='Example: python region_visualizer_crossings.py /path/to/data --collections Collection_A Collection_C'
     )
-    parser.add_argument('input_dir', type=str,
-                       help='Input directory containing PageXML files')
+    parser.add_argument('input_dir', type=str, nargs='?', default=None,
+                       help='Input directory containing PageXML files (optional - will prompt if not provided)')
+    parser.add_argument('--collections', type=str, nargs='+', default=None,
+                       help='Specific collection folders to process (e.g., --collections Collection_A Collection_C). If not specified, all collections are processed.')
     parser.add_argument('--colour-config', type=str, default=None,
                        help='JSON file with custom colour configuration')
     parser.add_argument('--dark-theme', action='store_true',
@@ -768,10 +782,48 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
+    # Interactive mode: ask for input directory if not provided
+    if args.input_dir is None:
+        print("=== Region Visualizer with Textline Crossing Detection ===\n")
+        input_dir = input("Enter the path to the directory containing collections: ").strip()
+        input_dir = input_dir.strip('"').strip("'")
+        
+        if not input_dir or not os.path.exists(input_dir):
+            print(f"Error: Invalid or non-existent path: {input_dir}")
+            exit(1)
+    else:
+        input_dir = args.input_dir
+    
+    # Interactive mode: ask for collections if not provided via command line
+    selected_collections = args.collections
+    if selected_collections is None and args.input_dir is None:  # Only ask if running interactively
+        print("\nDo you want to process specific collections, or all collections?")
+        choice = input("Enter 'specific' to select collections, or press Enter for all: ").strip().lower()
+        
+        if choice in ['specific', 's']:
+            print("\nAvailable folders in the directory:")
+            try:
+                available_folders = sorted([f for f in os.listdir(input_dir) 
+                                          if os.path.isdir(os.path.join(input_dir, f))])
+                for i, folder in enumerate(available_folders, 1):
+                    print(f"  {i}. {folder}")
+            except Exception as e:
+                print(f"Could not list folders: {e}")
+            
+            print("\nEnter collection names separated by spaces (e.g., Collection_A Collection_C):")
+            collections_input = input("Collections: ").strip()
+            
+            if collections_input:
+                selected_collections = collections_input.split()
+                print(f"Selected collections: {', '.join(selected_collections)}")
+            else:
+                print("No collections specified, processing all collections.")
+    
     process_directory(
-        args.input_dir,
+        input_dir,
         args.colour_config,
         args.dark_theme,
         args.scale,
-        args.columns
+        args.columns,
+        selected_collections
     )
